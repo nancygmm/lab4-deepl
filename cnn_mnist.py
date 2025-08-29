@@ -9,10 +9,125 @@ import numpy as np
 from typing import Literal
 import matplotlib.pyplot as plt
 import seaborn as sns
-from sklearn.metrics import confusion_matrix
 import pandas as pd
 import json
 from pathlib import Path
+import time, itertools
+from sklearn.metrics import confusion_matrix, classification_report
+
+def accuracy_per_kparams(acc: float, n_params: int) -> float:
+    return acc / (max(n_params,1) / 1_000)
+
+def confusion_matrix_fig(cm, title="Matriz de Confusión", labels=None, normalize=False, fname=None):
+    import matplotlib.pyplot as plt
+    import numpy as np
+
+    if labels is None:
+        labels = list(range(cm.shape[0]))
+
+    cm_plot = cm.astype(float)
+    if normalize:
+        row_sums = cm_plot.sum(axis=1, keepdims=True)
+        row_sums[row_sums == 0] = 1.0
+        cm_plot = cm_plot / row_sums
+
+    plt.figure(figsize=(7.2, 6.0))
+    plt.imshow(cm_plot, interpolation='nearest')
+    plt.title(title)
+    plt.xlabel('Predicción')
+    plt.ylabel('Etiqueta real')
+    plt.xticks(ticks=np.arange(len(labels)), labels=labels)
+    plt.yticks(ticks=np.arange(len(labels)), labels=labels)
+
+    for i in range(cm_plot.shape[0]):
+        for j in range(cm_plot.shape[1]):
+            val = f"{cm_plot[i, j]:.2f}" if normalize else f"{int(cm_plot[i, j])}"
+            plt.text(j, i, val, ha="center", va="center")
+
+    plt.tight_layout()
+    if fname:
+        plt.savefig(fname, dpi=160, bbox_inches='tight')
+    plt.show()
+
+def top_confusions(cm, k=5):
+    pairs = []
+    n = cm.shape[0]
+    for i, j in itertools.product(range(n), range(n)):
+        if i == j: 
+            continue
+        if cm[i, j] > 0:
+            pairs.append((i, j, int(cm[i, j])))
+    pairs.sort(key=lambda t: t[2], reverse=True)
+    return pairs[:k]
+
+def analyze_confusions(cm_cnn, cm_mlp, k=5):
+    top_cnn = top_confusions(cm_cnn, k)
+    top_mlp = top_confusions(cm_mlp, k)
+
+    set_cnn = {(a,b) for a,b,_ in top_cnn}
+    set_mlp = {(a,b) for a,b,_ in top_mlp}
+    inter = list(set_cnn.intersection(set_mlp))
+
+    return {
+        "top_cnn": top_cnn,
+        "top_mlp": top_mlp,
+        "coinciden": inter,
+    }
+
+def benchmark_report(best_cnn_dict, mlp_acc, mlp_params, cm_cnn, cm_mlp):
+    cnn_name = best_cnn_dict['experiment']
+    cnn_acc  = best_cnn_dict['test_accuracy']
+    cnn_par  = best_cnn_dict['num_parameters']
+
+    eff_cnn  = accuracy_per_kparams(cnn_acc, cnn_par)
+    eff_mlp  = accuracy_per_kparams(mlp_acc, mlp_params)
+
+    mejor_global = "CNN" if cnn_acc >= mlp_acc else "MLP"
+    mejor_eficiencia = "CNN" if eff_cnn >= eff_mlp else "MLP"
+
+    conf = analyze_confusions(cm_cnn, cm_mlp, k=6)
+
+    print("\n================= BENCHMARK (Punto 3) =================")
+    print(f"• Mejor rendimiento general: {mejor_global}")
+    print(f"  - {cnn_name}: accuracy={cnn_acc:.3f} | params={cnn_par:,}")
+    print(f"  - MLP:       accuracy={mlp_acc:.3f} | params={mlp_params:,}")
+
+    print(f"\n• Eficiencia (accuracy por 1k params):")
+    print(f"  - {cnn_name}: {eff_cnn:.6f}")
+    print(f"  - MLP:       {eff_mlp:.6f}")
+    print(f"  ⇒ Mayor accuracy/params: {mejor_eficiencia}")
+
+    print("\n• Matrices de confusión:")
+    print("  - Guardadas como 'cm_cnn.png' y 'cm_mlp.png' (también versión normalizada).")
+
+    print("\n• Errores de clasificación más frecuentes (top-6 por modelo):")
+    def fmt_pairs(pairs):
+        return ", ".join([f"{a}→{b}({c})" for a,b,c in pairs]) if pairs else "—"
+    print(f"  - CNN: {fmt_pairs(conf['top_cnn'])}")
+    print(f"  - MLP: {fmt_pairs(conf['top_mlp'])}")
+
+    if conf['coinciden']:
+        coinciden_txt = ", ".join([f"{a}→{b}" for a,b in conf['coinciden']])
+        print(f"  - Coincidencias de confusión (ambos modelos): {coinciden_txt}")
+    else:
+        print("  - Coincidencias de confusión: ninguna relevante.")
+
+    print("\n• Posibles explicaciones:")
+    print("  - La CNN explota estructura espacial (convoluciones y pooling) y comparte pesos,")
+    print("    lo que suele mejorar generalización con menos parámetros efectivos.")
+    print("  - El MLP aplana la imagen y pierde relaciones locales (bordes/textura).")
+    print("  - Si hay overfitting: revisar dropout/weight_decay y early stopping.")
+    print("  - Si los errores coinciden en ciertas clases, puede deberse a clases visualmente")
+    print("    similares o a insuficiencia de muestras para esas clases.")
+
+    return {
+        "mejor_global": mejor_global,
+        "mejor_eficiencia": mejor_eficiencia,
+        "eff_cnn": eff_cnn,
+        "eff_mlp": eff_mlp,
+        "top_confusions": conf
+    }
+
 
 _device = "cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu")
 
@@ -278,7 +393,18 @@ def main():
     
     mlp_preds, mlp_true = get_predictions(trained_baseline, baseline_test_loader, baseline_cfg.device)
     plot_confusion_matrix(mlp_true, mlp_preds, "MLP")
-    
+
+    cm_cnn = confusion_matrix(cnn_true, cnn_preds, labels=list(range(10)))
+    cm_mlp = confusion_matrix(mlp_true, mlp_preds, labels=list(range(10)))
+
+    confusion_matrix_fig(cm_cnn, title="Matriz de Confusión - CNN", labels=list(range(10)), normalize=False, fname="cm_cnn.png")
+    confusion_matrix_fig(cm_cnn, title="Matriz de Confusión (Norm) - CNN", labels=list(range(10)), normalize=True, fname="cm_cnn_norm.png")
+    confusion_matrix_fig(cm_mlp, title="Matriz de Confusión - MLP", labels=list(range(10)), normalize=False, fname="cm_mlp.png")
+    confusion_matrix_fig(cm_mlp, title="Matriz de Confusión (Norm) - MLP", labels=list(range(10)), normalize=True, fname="cm_mlp_norm.png")
+
+    mlp_params = count_params(trained_baseline)
+    _ = benchmark_report(best_cnn, baseline_acc, mlp_params, cm_cnn, cm_mlp)
+
     print("Laboratorio completado")
 
 if __name__ == "__main__":
